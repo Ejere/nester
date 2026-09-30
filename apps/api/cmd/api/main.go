@@ -1,5 +1,3 @@
-// TODO(#786): coordinated graceful shutdown and draining for background
-// workers (indexer, schedulers, transaction poller, notifiers).
 package main
 
 import (
@@ -12,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -152,6 +151,14 @@ func run() error {
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Every long-lived background worker below (schedulers, trackers, the
+	// event indexer, the transaction poller, notifier jobs) registers on
+	// this WaitGroup so shutdown can wait for them to actually observe
+	// cancellation and return, not just cancel their contexts and hope
+	// (issue #786). A one-shot goroutine that already bounds its own
+	// lifetime (e.g. the yield-cache warm below) does not need to join it.
+	var workers sync.WaitGroup
+
 	// Distributed tracing (#1054). Installed before any dependency is opened
 	// so the pool, cache and HTTP clients below are all created against a
 	// configured provider. Disabled by default: Init then installs a no-op
@@ -254,7 +261,11 @@ func run() error {
 		},
 		baseLogger.WithGroup("scheduler-leadership"),
 	)
-	go schedulerLeadership.Run(shutdownCtx)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		schedulerLeadership.Run(shutdownCtx)
+	}()
 
 	systemStateRepository := postgres.NewSystemStateRepository(db)
 
@@ -604,9 +615,13 @@ func run() error {
 		return claims.Subject, claims.SessionID, nil
 	}, cfg.AllowedOrigins(), redisClient, maxWSConnsPerIP)
 
-	wsCtx, wsCancel := context.WithCancel(context.Background())
+	wsCtx, wsCancel := context.WithCancel(shutdownCtx)
 	defer wsCancel()
-	go wsHub.Run(wsCtx)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		wsHub.Run(wsCtx)
+	}()
 	vaultHandler.SetWSHub(wsHub)
 
 	// Real-time portfolio valuation (#832): aggregates each user's positions,
@@ -666,9 +681,11 @@ func run() error {
 		contractReader,
 		cfg.Performance().SnapshotInterval(),
 	)
-	trackerCtx, cancelTracker := context.WithCancel(context.Background())
+	trackerCtx, cancelTracker := context.WithCancel(shutdownCtx)
 	defer cancelTracker()
+	workers.Add(1)
 	go func() {
+		defer workers.Done()
 		if err := tracker.Run(trackerCtx); err != nil && !errors.Is(err, context.Canceled) {
 			baseLogger.Error("performance tracker stopped", "error", err.Error())
 		}
@@ -684,9 +701,11 @@ func run() error {
 		contractReader,
 		cfg.TVL().RefreshInterval(),
 	).WithLogger(baseLogger.WithGroup("tvl-tracker"))
-	tvlCtx, cancelTVL := context.WithCancel(context.Background())
+	tvlCtx, cancelTVL := context.WithCancel(shutdownCtx)
 	defer cancelTVL()
+	workers.Add(1)
 	go func() {
+		defer workers.Done()
 		if err := tvlTracker.Run(tvlCtx); err != nil && !errors.Is(err, context.Canceled) {
 			baseLogger.Error("tvl tracker stopped", "error", err.Error())
 		}
@@ -716,9 +735,11 @@ func run() error {
 			})
 		},
 	).WithLogger(baseLogger.WithGroup("apy-refresher"))
-	apyCtx, cancelAPY := context.WithCancel(context.Background())
+	apyCtx, cancelAPY := context.WithCancel(shutdownCtx)
 	defer cancelAPY()
+	workers.Add(1)
 	go func() {
+		defer workers.Done()
 		if err := apyRefresher.Run(apyCtx); err != nil && !errors.Is(err, context.Canceled) {
 			baseLogger.Error("apy refresher stopped", "error", err.Error())
 		}
@@ -758,16 +779,22 @@ func run() error {
 	// poller's findings reach the log only, so a divergence — a balance that
 	// disagrees with the chain — is invisible to alerting.
 	txPoller.SetMetrics(appMetrics)
-	pollerCtx, cancelPoller := context.WithCancel(context.Background())
+	pollerCtx, cancelPoller := context.WithCancel(shutdownCtx)
 	defer cancelPoller()
-	go txPoller.Run(pollerCtx)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		txPoller.Run(pollerCtx)
+	}()
 
 	// Age the reconcile gauge between passes (#1108). RecordReconcileRun
 	// resets it to zero on each completed pass; nothing else would move it, so
 	// a poller that dies would leave the gauge frozen at zero and read as
 	// "just reconciled" forever — the same failure mode the indexer's
 	// lag_last_sample_age gauge exists to prevent.
+	workers.Add(1)
 	go func() {
+		defer workers.Done()
 		const reconcileAgeInterval = 15 * time.Second
 		ticker := time.NewTicker(reconcileAgeInterval)
 		defer ticker.Stop()
@@ -999,9 +1026,13 @@ func run() error {
 	)
 	protocolHealthChecker.SetDeteriorationEngine(deteriorationEngine)
 
-	protocolHealthCtx, cancelProtocolHealth := context.WithCancel(context.Background())
+	protocolHealthCtx, cancelProtocolHealth := context.WithCancel(shutdownCtx)
 	defer cancelProtocolHealth()
-	go protocolHealthChecker.Run(protocolHealthCtx)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		protocolHealthChecker.Run(protocolHealthCtx)
+	}()
 
 	// APY deviation alert (#846): notifies a vault's users when its APY drops
 	// >20% from its 30-day mean. Notification-only, but gated behind
@@ -1033,9 +1064,13 @@ func run() error {
 		baseLogger.WithGroup("apy-deviation"),
 	)
 	apyDeviationJob.SetLeaderChecker(schedulerLeadership)
-	apyDeviationCtx, cancelAPYDeviation := context.WithCancel(context.Background())
+	apyDeviationCtx, cancelAPYDeviation := context.WithCancel(shutdownCtx)
 	defer cancelAPYDeviation()
-	go apyDeviationJob.Run(apyDeviationCtx)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		apyDeviationJob.Run(apyDeviationCtx)
+	}()
 
 	// User watchlist
 	watchlistSvc := service.NewWatchlistService(db)
@@ -1087,9 +1122,13 @@ func run() error {
 		nudgeEngineSvc,
 		baseLogger.WithGroup("nudge-engine"),
 	)
-	nudgeCtx, cancelNudge := context.WithCancel(context.Background())
+	nudgeCtx, cancelNudge := context.WithCancel(shutdownCtx)
 	defer cancelNudge()
-	go nudgeEngineJob.Run(nudgeCtx)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		nudgeEngineJob.Run(nudgeCtx)
+	}()
 
 	// Durable async job queue (#824): the shared worker pool and producer
 	// client. Hoisted here (rather than further down where the harvest/
@@ -1107,9 +1146,13 @@ func run() error {
 	// isn't constructed yet at this point in main). adminService (constructed
 	// earlier) satisfies service.RebalanceTrigger directly.
 	apyDriftDetector.SetJobEnqueuer(jobQueueClient)
-	apyDriftCtx, cancelAPYDrift := context.WithCancel(context.Background())
+	apyDriftCtx, cancelAPYDrift := context.WithCancel(shutdownCtx)
 	defer cancelAPYDrift()
-	go apyDriftDetector.Run(apyDriftCtx)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		apyDriftDetector.Run(apyDriftCtx)
+	}()
 
 	// Outbound webhooks (#836): subscriptions with SSRF-validated targets and
 	// encrypted signing secrets; delivery goes through the durable job queue
@@ -1193,9 +1236,13 @@ func run() error {
 		notificationDispatcher2,
 		baseLogger.WithGroup("goal-notification-digest"),
 	)
-	goalDigestCtx, cancelGoalDigest := context.WithCancel(context.Background())
+	goalDigestCtx, cancelGoalDigest := context.WithCancel(shutdownCtx)
 	defer cancelGoalDigest()
-	go goalNotificationDigestJob.Run(goalDigestCtx)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		goalNotificationDigestJob.Run(goalDigestCtx)
+	}()
 
 	savingsScheduleHandler := handler.NewSavingsScheduleHandler(savingsScheduleSvc)
 	savingsScheduleHandler.Register(mux)
@@ -1249,9 +1296,13 @@ func run() error {
 		baseLogger.WithGroup("recurring-deposit"),
 	)
 	recurringDepositJob.SetLeaderChecker(schedulerLeadership)
-	recurringCtx, cancelRecurring := context.WithCancel(context.Background())
+	recurringCtx, cancelRecurring := context.WithCancel(shutdownCtx)
 	defer cancelRecurring()
-	go recurringDepositJob.Run(recurringCtx)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		recurringDepositJob.Run(recurringCtx)
+	}()
 
 	// Savings goal soft-delete recovery purge (#924): hard-deletes goals
 	// whose deleted_at is older than savingsgoal.SavingsGoalRecoveryWindow.
@@ -1262,9 +1313,13 @@ func run() error {
 		baseLogger.WithGroup("savings-goal-purge"),
 	)
 	savingsGoalPurgeJob.SetLeaderChecker(schedulerLeadership)
-	savingsGoalPurgeCtx, cancelSavingsGoalPurge := context.WithCancel(context.Background())
+	savingsGoalPurgeCtx, cancelSavingsGoalPurge := context.WithCancel(shutdownCtx)
 	defer cancelSavingsGoalPurge()
-	go savingsGoalPurgeJob.Run(savingsGoalPurgeCtx, 24*time.Hour)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		savingsGoalPurgeJob.Run(savingsGoalPurgeCtx, 24*time.Hour)
+	}()
 
 	// Data retention sweep (#1226): hard-deletes activity_events and
 	// nudge_dispatch_log (nudge_outcomes cascades) rows past their retention
@@ -1282,9 +1337,13 @@ func run() error {
 		baseLogger.WithGroup("data-retention"),
 	)
 	dataRetentionJob.SetLeaderChecker(schedulerLeadership)
-	dataRetentionCtx, cancelDataRetention := context.WithCancel(context.Background())
+	dataRetentionCtx, cancelDataRetention := context.WithCancel(shutdownCtx)
 	defer cancelDataRetention()
-	go dataRetentionJob.Run(dataRetentionCtx, 24*time.Hour)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		dataRetentionJob.Run(dataRetentionCtx, 24*time.Hour)
+	}()
 
 	jobWorker := jobqueue.NewWorker(
 		jobQueueRepo,
@@ -1390,9 +1449,13 @@ func run() error {
 		baseLogger.WithGroup("outbox-relay"),
 		outboxMetrics,
 	)
-	outboxCtx, cancelOutbox := context.WithCancel(context.Background())
+	outboxCtx, cancelOutbox := context.WithCancel(shutdownCtx)
 	defer cancelOutbox()
-	go func() { _ = outboxRelay.Run(outboxCtx) }()
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		_ = outboxRelay.Run(outboxCtx)
+	}()
 
 	// Retention: without it the outbox only ever grows, on the write path of
 	// every domain transaction that inserts into it. Leader-gated because
@@ -1402,9 +1465,13 @@ func run() error {
 		DeadRetention:       cfg.Outbox().DeadRetention(),
 	}, baseLogger.WithGroup("outbox-retention"), outboxMetrics)
 	outboxRetentionJob.SetLeaderChecker(schedulerLeadership)
-	outboxRetentionCtx, cancelOutboxRetention := context.WithCancel(context.Background())
+	outboxRetentionCtx, cancelOutboxRetention := context.WithCancel(shutdownCtx)
 	defer cancelOutboxRetention()
-	go outboxRetentionJob.Run(outboxRetentionCtx, cfg.Outbox().RetentionInterval())
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		outboxRetentionJob.Run(outboxRetentionCtx, cfg.Outbox().RetentionInterval())
+	}()
 
 	harvestEngine := harvest.New(
 		harvest.Config{
@@ -1420,13 +1487,19 @@ func run() error {
 	)
 	harvestHandler := handler.NewHarvestHandler(harvestEngine)
 	harvestHandler.Register(mux)
-	harvestCtx, cancelHarvest := context.WithCancel(context.Background())
+	harvestCtx, cancelHarvest := context.WithCancel(shutdownCtx)
 	defer cancelHarvest()
-	go harvestEngine.Run(harvestCtx)
-
-	jobQueueCtx, cancelJobQueue := context.WithCancel(context.Background())
-	defer cancelJobQueue()
+	workers.Add(1)
 	go func() {
+		defer workers.Done()
+		harvestEngine.Run(harvestCtx)
+	}()
+
+	jobQueueCtx, cancelJobQueue := context.WithCancel(shutdownCtx)
+	defer cancelJobQueue()
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
 		if err := jobWorker.Run(jobQueueCtx); err != nil && !errors.Is(err, context.Canceled) {
 			baseLogger.Error("job queue worker stopped", "error", err.Error())
 		}
@@ -1451,9 +1524,13 @@ func run() error {
 		baseLogger.WithGroup("ledger-verification"),
 	)
 	ledgerVerificationJob.SetLeaderChecker(schedulerLeadership)
-	verificationCtx, cancelVerification := context.WithCancel(context.Background())
+	verificationCtx, cancelVerification := context.WithCancel(shutdownCtx)
 	defer cancelVerification()
-	go ledgerVerificationJob.Run(verificationCtx)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		ledgerVerificationJob.Run(verificationCtx)
+	}()
 
 	// Ledger reconciliation job: compares ledger vault-pool vs on-chain and sum
 	// user positions vs share price.
@@ -1472,9 +1549,13 @@ func run() error {
 		Config:      ledgerDomainConfig(),
 	})
 	ledgerReconciliationJob.SetLeaderChecker(schedulerLeadership)
-	reconciliationCtx, cancelReconciliation := context.WithCancel(context.Background())
+	reconciliationCtx, cancelReconciliation := context.WithCancel(shutdownCtx)
 	defer cancelReconciliation()
-	go ledgerReconciliationJob.Run(reconciliationCtx)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		ledgerReconciliationJob.Run(reconciliationCtx)
+	}()
 
 	performanceSnapshotsHandler := handler.NewPerformanceSnapshotsHandler(performanceService)
 	performanceSnapshotsHandler.Register(mux)
@@ -1486,9 +1567,13 @@ func run() error {
 	apySvc := service.NewAPYService(apySnapshotRepo)
 	apyHandler := handler.NewAPYHandler(apySvc)
 	apyHandler.Register(mux)
-	apySchedulerCtx, cancelAPYScheduler := context.WithCancel(context.Background())
+	apySchedulerCtx, cancelAPYScheduler := context.WithCancel(shutdownCtx)
 	defer cancelAPYScheduler()
-	go apySvc.StartScheduler(apySchedulerCtx)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		apySvc.StartScheduler(apySchedulerCtx)
+	}()
 
 	// walletBindingCacheTTL bounds how long a stale wallet binding can still
 	// be accepted after the account's wallet changes. Short enough that a
@@ -1571,9 +1656,13 @@ func run() error {
 	}
 	idempotencyRoutes = append(idempotencyRoutes, middleware.VaultMoneyPathIdempotencyRoutes()...)
 	idempotencyMiddleware := middleware.IdempotencyMiddleware(idempotencyStore, idempotencyRoutes)
-	idempotencyPurgeCtx, cancelIdempotencyPurge := context.WithCancel(context.Background())
+	idempotencyPurgeCtx, cancelIdempotencyPurge := context.WithCancel(shutdownCtx)
 	defer cancelIdempotencyPurge()
-	go runIdempotencyPurge(idempotencyPurgeCtx, idempotencyStore, baseLogger.WithGroup("idempotency-purge"))
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		runIdempotencyPurge(idempotencyPurgeCtx, idempotencyStore, baseLogger.WithGroup("idempotency-purge"))
+	}()
 
 	// costQuota meters downstream *work* per authenticated user, where the
 	// limiters above meter request *count* per IP. Both apply: a caller can
@@ -1731,7 +1820,11 @@ func run() error {
 		// Same leader gate the rebalancer and protocol-health jobs use, so
 		// one instance sweeps rather than every replica.
 		submissionReconciler.SetLeaderChecker(schedulerLeadership)
-		go submissionReconciler.Run(shutdownCtx)
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			submissionReconciler.Run(shutdownCtx)
+		}()
 	}
 
 	// Vault-balance reconciliation (nester#1082). The scheduled safety net for
@@ -1784,7 +1877,11 @@ func run() error {
 	if err := appMetrics.RegisterBalanceReconcileAge(balanceReconciler.AgeSample); err != nil {
 		baseLogger.Error("failed to register balance reconcile age collector", "error", err)
 	}
-	go balanceReconciler.Run(shutdownCtx)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		balanceReconciler.Run(shutdownCtx)
+	}()
 
 	// Balance-freshness SLI (nester#1056, nester#1088): the indexer samples
 	// its own position against the network tip on every tick and publishes it
@@ -1796,7 +1893,7 @@ func run() error {
 		RPCOptions:      sorobanRPCOptions,
 		Recorder:        indexerFreshness,
 		DepositObserver: savingsGamificationSvc,
-	})
+	}, &workers)
 
 	// The metrics endpoint runs on its own listener so it is never reachable
 	// through the public port. It is not registered on mux at any point, so
@@ -1853,6 +1950,30 @@ func run() error {
 
 	if err := <-serverErr; err != nil {
 		return err
+	}
+
+	// Every background worker above shares shutdownCtx (or a context derived
+	// from it), so stop() at the top of this function already told all of
+	// them to return. This just waits for that to actually finish, instead
+	// of exiting the process while one is still mid-cycle (issue #786): the
+	// scenario that risks a partial write, or, for the event indexer
+	// specifically, a cursor that advanced past an event whose mutation did
+	// not land.
+	//
+	// Bounded by the same graceful-shutdown deadline as the HTTP drain
+	// above rather than waiting a second time: a worker that ignores
+	// cancellation is a bug to fix, not something worth doubling the
+	// shutdown budget for.
+	workersDone := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(workersDone)
+	}()
+	select {
+	case <-workersDone:
+		baseLogger.Info("background workers drained")
+	case <-ctx.Done():
+		baseLogger.Warn("background workers did not finish draining before the shutdown deadline; exiting anyway")
 	}
 
 	baseLogger.Info("server stopped",
