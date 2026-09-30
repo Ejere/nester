@@ -1,3 +1,5 @@
+// TODO(#786): coordinated graceful shutdown and draining for background
+// workers (indexer, schedulers, transaction poller, notifiers).
 package main
 
 import (

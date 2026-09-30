@@ -1,3 +1,5 @@
+// TODO(#44): extend coverage per the issue's test matrix (domain
+// validation, partial UpdateUser, duplicate-wallet handling).
 package service
 
 import (
